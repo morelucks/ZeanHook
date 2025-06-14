@@ -19,7 +19,6 @@ import {FixedPointMathLib} from "solmate/src/utils/FixedPointMathLib.sol";
  
 contract ZeanHook is BaseHook {
     using PoolIdLibrary for PoolKey;
-    using FixedPointMathLib for uint256;
 
     /**
      * Constants for slippage bounds (in basis points)
@@ -122,31 +121,31 @@ contract ZeanHook is BaseHook {
         
         emit PriceRecorded(poolId, sqrtPriceX96, block.timestamp);
         
-        return BaseHook.afterInitialize.selector;
+        // return this.afterInitialize.selector;
+        return ZeanHook.afterInitialize.selector;
     }
 
-    function beforeSwap(
+    function _beforeSwap(
         address,
         PoolKey calldata key,
-        SwapParams calldata params,
         bytes calldata hookData
-    ) external override returns (bytes4, BeforeSwapDelta, uint24) {
+    ) internal view returns (bytes4, BeforeSwapDelta, uint24) {
         PoolId poolId = key.toId();
         
         uint256 adjustedSlippage = calculateVolatilityAdjustedSlippage(poolId);
         
-        _validateSwapSlippage(params, adjustedSlippage, hookData);
+        _validateSwapSlippage(adjustedSlippage, hookData);
         
-        return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
+        return (this.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
     }
 
-    function afterSwap(
+    function _afterSwap(
         address,
         PoolKey calldata key,
         SwapParams calldata,
         BalanceDelta,
         bytes calldata
-    ) external override returns (bytes4, int128) {
+    ) internal override returns (bytes4, int128) {
         PoolId poolId = key.toId();
         
         uint160 currentSqrtPrice = _getCurrentSqrtPrice(poolId);
@@ -156,7 +155,7 @@ contract ZeanHook is BaseHook {
         
         lastSwapTimestamp[poolId] = block.timestamp;
         
-        return (BaseHook.afterSwap.selector, 0);
+        return (this.afterSwap.selector, 0);
     }
 
     /**
@@ -317,7 +316,6 @@ contract ZeanHook is BaseHook {
     }
     
     function _validateSwapSlippage(
-        SwapParams calldata params,
         uint256 recommendedSlippage,
         bytes calldata hookData
     ) internal pure {
@@ -334,9 +332,9 @@ contract ZeanHook is BaseHook {
     
     function _getCurrentSqrtPrice(PoolId poolId) internal view returns (uint160) {
         bytes32 slot0 = poolManager.extsload(bytes32(uint256(PoolId.unwrap(poolId))));
-        
+
         uint160 sqrtPriceX96 = uint160(uint256(slot0));
-        
+
         return sqrtPriceX96;
     }
     
