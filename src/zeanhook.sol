@@ -128,7 +128,7 @@ contract ZeanHook is BaseHook {
     function beforeSwap(
         address,
         PoolKey calldata key,
-        IPoolManager.SwapParams calldata params,
+        SwapParams calldata params,
         bytes calldata hookData
     ) external override returns (bytes4, BeforeSwapDelta, uint24) {
         PoolId poolId = key.toId();
@@ -143,7 +143,7 @@ contract ZeanHook is BaseHook {
     function afterSwap(
         address,
         PoolKey calldata key,
-        IPoolManager.SwapParams calldata,
+        SwapParams calldata,
         BalanceDelta,
         bytes calldata
     ) external override returns (bytes4, int128) {
@@ -317,7 +317,7 @@ contract ZeanHook is BaseHook {
     }
     
     function _validateSwapSlippage(
-        IPoolManager.SwapParams calldata params,
+        SwapParams calldata params,
         uint256 recommendedSlippage,
         bytes calldata hookData
     ) internal pure {
