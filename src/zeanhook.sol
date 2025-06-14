@@ -333,8 +333,11 @@ contract ZeanHook is BaseHook {
     }
     
     function _getCurrentSqrtPrice(PoolId poolId) internal view returns (uint160) {
-        //TODO: This would get the current sqrt price from the pool manager
-        return 0;
+        bytes32 slot0 = poolManager.extsload(bytes32(uint256(PoolId.unwrap(poolId))));
+        
+        uint160 sqrtPriceX96 = uint160(uint256(slot0));
+        
+        return sqrtPriceX96;
     }
     
     function _sqrt(uint256 x) internal pure returns (uint256) {
