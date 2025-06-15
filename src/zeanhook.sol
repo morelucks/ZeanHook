@@ -11,6 +11,7 @@ import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
 import {Hooks} from "v4-core/libraries/Hooks.sol";
 import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "v4-core/types/BeforeSwapDelta.sol";
 import {FixedPointMathLib} from "solmate/src/utils/FixedPointMathLib.sol";
+import {StateLibrary} from "v4-core/libraries/StateLibrary.sol";
 
 /**
  * @title ZeanHook - Base contract for Uniswap V4 hooks
@@ -28,6 +29,10 @@ contract ZeanHook is BaseHook {
     uint256 public constant MIN_SLIPPAGE = 10;
     uint256 public constant MAX_SLIPPAGE = 500;
     uint256 public constant BASIS_POINTS = 10000;
+    // connstants for batch transactions 
+     uint256 public constant BATCH_INTERVAL = 180;
+    uint256 public constant MAX_BATCH_SIZE = 100;
+    uint256 public constant PRICE_DEVIATION_THRESHOLD = 50;
 
     /**
      * Parameters for volatility calculation
@@ -35,7 +40,25 @@ contract ZeanHook is BaseHook {
     uint256 public constant VOLATILITY_WINDOW = 24 hours;
     uint256 public constant MIN_SAMPLES = 5;
     uint256 public constant VOLATILITY_MULTIPLIER = 100;
+    // ========================= Structs =========================
+    struct BatchedSwap {
+        address user;
+        SwapParams params;
+        uint256 queueTime;
+        uint256 minAmountOut;
+        uint160 maxSqrtPriceX96;
+        uint160 minSqrtPriceX96;
+        bool isExecuted;
+        bytes hookData;
+    }
 
+    struct BatchState {
+        uint256 batchStartTime;
+        uint160 referenceSqrtPriceX96;
+        bool batchActive;
+        uint256 batchCount;
+        uint256 totalQueuedSwaps;
+    }
     struct PriceData {
         uint160 sqrtPriceX96;
         uint256 timestamp;
@@ -50,6 +73,10 @@ contract ZeanHook is BaseHook {
     mapping(PoolId => PriceData[]) public priceHistory;
     mapping(PoolId => VolatilityMetrics) public volatilityMetrics;
     mapping(PoolId => uint256) public lastSwapTimestamp;
+    mapping(PoolId => BatchedSwap[]) public poolBatches;
+    mapping(PoolId => BatchState) public batchStates;
+    mapping(PoolId => mapping(address => uint256)) public userPendingSwaps;
+    mapping(address => bool) public authorizedExecutors;
 
     event SlippageCalculated(
         PoolId indexed poolId,
@@ -64,6 +91,64 @@ contract ZeanHook is BaseHook {
         uint256 timestamp
     );
 
+
+   
+    address public owner;
+
+   
+    bool private _executing;
+
+    // ========================= Events =========================
+    event SwapQueued(
+        PoolId indexed poolId,
+        address indexed user,
+        uint256 batchIndex,
+        uint256 queueTime
+    );
+
+    event BatchExecuted(
+        PoolId indexed poolId,
+        uint256 swapsExecuted,
+        uint160 executionPrice,
+        uint256 timestamp
+    );
+
+    event SwapFailed(
+        PoolId indexed poolId,
+        address indexed user,
+        uint256 batchIndex,
+        string reason
+    );
+
+    event BatchInitialized(
+        PoolId indexed poolId,
+        uint160 referencePrice,
+        uint256 startTime
+    );
+
+    event ExecutorAuthorized(address indexed executor, bool authorized);
+
+    // ========================= Modifiers =========================
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Only owner");
+        _;
+    }
+
+    modifier onlyAuthorizedExecutor() {
+        require(
+            authorizedExecutors[msg.sender] || msg.sender == owner,
+            "Not authorized executor"
+        );
+        _;
+    }
+
+    modifier noReentrant() {
+        require(!_executing, "Reentrant call");
+        _executing = true;
+        _;
+        _executing = false;
+    }
+
      /**
      * @notice Constructor initializes the hook with a PoolManager
      * @param _manager The address of the Uniswap V4 PoolManager contract
@@ -71,7 +156,11 @@ contract ZeanHook is BaseHook {
      */
     constructor(
         IPoolManager _manager
-    ) BaseHook(_manager) {}
+    ) BaseHook(_manager) {
+        owner = msg.sender;
+        authorizedExecutors[msg.sender] = true;
+    }
+    
  
 	// Set up hook permissions to return `true`
     function getHookPermissions()
@@ -118,6 +207,8 @@ contract ZeanHook is BaseHook {
             lastUpdate: block.timestamp,
             sampleCount: 1
         });
+
+
         
         emit PriceRecorded(poolId, sqrtPriceX96, block.timestamp);
         
@@ -126,16 +217,20 @@ contract ZeanHook is BaseHook {
     }
 
     function _beforeSwap(
-        address,
+        address sender,
         PoolKey calldata key,
-        bytes calldata hookData
-    ) internal view returns (bytes4, BeforeSwapDelta, uint24) {
+        bytes calldata hookData,
+        SwapParams calldata params
+
+    ) internal returns (bytes4, BeforeSwapDelta, uint24) {
         PoolId poolId = key.toId();
         
         uint256 adjustedSlippage = calculateVolatilityAdjustedSlippage(poolId);
         
         _validateSwapSlippage(adjustedSlippage, hookData);
-        
+
+        _queueSwap(poolId, key, sender, params, hookData);
+
         return (this.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
     }
 
@@ -156,6 +251,445 @@ contract ZeanHook is BaseHook {
         lastSwapTimestamp[poolId] = block.timestamp;
         
         return (this.afterSwap.selector, 0);
+    }
+
+    function queueSwap(
+        PoolKey calldata key,
+        SwapParams calldata params,
+        uint256 minAmountOut,
+        uint160 maxSqrtPriceX96,
+        uint160 minSqrtPriceX96,
+        bytes calldata hookData
+    ) external {
+        PoolId poolId = key.toId();
+
+        // Validate price limits
+        if (maxSqrtPriceX96 > 0 && minSqrtPriceX96 > 0) {
+            require(maxSqrtPriceX96 > minSqrtPriceX96, "Invalid price limits");
+        }
+
+        _addSwapToBatch(
+            poolId,
+            key,
+            msg.sender,
+            params,
+            minAmountOut,
+            maxSqrtPriceX96,
+            minSqrtPriceX96,
+            hookData
+        );
+    }
+
+
+ // ========================= Internal Functions =========================
+
+    /**
+     * @notice Internal function to queue a swap from beforeSwap hook
+     */
+    function _queueSwap(
+        PoolId poolId,
+        PoolKey calldata key,
+        address user,
+        SwapParams calldata params,
+        bytes calldata hookData
+    ) internal {
+        // Decode additional parameters from hookData if provided
+        (
+            uint256 minAmountOut,
+            uint160 maxSqrtPriceX96,
+            uint160 minSqrtPriceX96
+        ) = hookData.length >= 96
+                ? abi.decode(hookData, (uint256, uint160, uint160))
+                : (0, uint160(0), uint160(0));
+
+        _addSwapToBatch(
+            poolId,
+            key,
+            user,
+            params,
+            minAmountOut,
+            maxSqrtPriceX96,
+            minSqrtPriceX96,
+            hookData
+        );
+    }
+
+
+
+    /**
+     * @notice Add a swap to the batch queue
+     */
+    function _addSwapToBatch(
+        PoolId poolId,
+        PoolKey calldata key,
+        address user,
+        SwapParams calldata params,
+        uint256 minAmountOut,
+        uint160 maxSqrtPriceX96,
+        uint160 minSqrtPriceX96,
+        bytes calldata hookData
+    ) internal {
+        // Validate swap parameters
+        require(params.amountSpecified != 0, "Invalid amount");
+
+        BatchedSwap memory newSwap = BatchedSwap({
+            user: user,
+            params: params,
+            queueTime: block.timestamp,
+            minAmountOut: minAmountOut,
+            maxSqrtPriceX96: maxSqrtPriceX96,
+            minSqrtPriceX96: minSqrtPriceX96,
+            isExecuted: false,
+            hookData: hookData
+        });
+
+        poolBatches[poolId].push(newSwap);
+        userPendingSwaps[poolId][user]++;
+
+        // Initialize or update batch state
+        BatchState storage batchState = batchStates[poolId];
+        if (!batchState.batchActive) {
+            batchState.batchActive = true;
+            batchState.batchStartTime = block.timestamp;
+            batchState.referenceSqrtPriceX96 = _getCurrentSqrtPrice(key.toId());
+            emit BatchInitialized(
+                poolId,
+                batchState.referenceSqrtPriceX96,
+                block.timestamp
+            );
+        }
+
+        emit SwapQueued(
+            poolId,
+            user,
+            poolBatches[poolId].length - 1,
+            block.timestamp
+        );
+    }
+
+/**
+     * @notice Execute a single swap at the reference price
+     */
+    function _executeSwapAtReferencePrice(
+        PoolKey calldata key,
+        BatchedSwap memory swapData,
+        uint160 referenceSqrtPriceX96
+    ) internal returns (bool success) {
+        // Validate price limits before execution
+        if (!_validatePriceLimits(swapData, referenceSqrtPriceX96)) {
+            return false;
+        }
+
+        // Create swap params with reference price as limit
+        SwapParams memory batchParams = SwapParams({
+            zeroForOne: swapData.params.zeroForOne,
+            amountSpecified: swapData.params.amountSpecified,
+            sqrtPriceLimitX96: referenceSqrtPriceX96
+        });
+
+        try poolManager.swap(key, batchParams, swapData.hookData) returns (
+            BalanceDelta delta
+        ) {
+            // Validate minimum output if specified
+            if (swapData.minAmountOut > 0) {
+                int256 outputAmount = swapData.params.zeroForOne
+                    ? -delta.amount1()
+                    : -delta.amount0();
+                if (
+                    outputAmount < 0 ||
+                    uint256(outputAmount) < swapData.minAmountOut
+                ) {
+                    return false;
+                }
+            }
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    /**
+     * @notice Execute a batch of swaps atomically
+     */
+    function _executeSwapBatch(
+        PoolKey calldata key,
+        PoolId poolId,
+        uint160 executionPrice
+    ) internal returns (uint256 executedCount) {
+        BatchedSwap[] storage batch = poolBatches[poolId];
+        executedCount = 0;
+
+        // Execute swaps up to maximum batch size
+        for (
+            uint256 i = 0;
+            i < batch.length && executedCount < MAX_BATCH_SIZE;
+            i++
+        ) {
+            if (!batch[i].isExecuted) {
+                if (
+                    _executeSwapAtReferencePrice(key, batch[i], executionPrice)
+                ) {
+                    batch[i].isExecuted = true;
+                    executedCount++;
+                    userPendingSwaps[poolId][batch[i].user]--;
+                } else {
+                    emit SwapFailed(
+                        poolId,
+                        batch[i].user,
+                        i,
+                        "Execution failed"
+                    );
+                }
+            }
+        }
+
+        // Clean up executed swaps
+        _cleanupBatch(poolId);
+
+        return executedCount;
+    }
+
+
+    /**
+     * @notice Validate price limits for a swap
+     */
+    function _validatePriceLimits(
+        BatchedSwap memory swapData,
+        uint160 referenceSqrtPriceX96
+    ) internal pure returns (bool) {
+        // Check price limits based on swap direction
+        if (swapData.params.zeroForOne) {
+            // For zeroForOne swaps, check minimum price
+            if (
+                swapData.minSqrtPriceX96 > 0 &&
+                referenceSqrtPriceX96 < swapData.minSqrtPriceX96
+            ) {
+                return false;
+            }
+        } else {
+            // For oneForZero swaps, check maximum price
+            if (
+                swapData.maxSqrtPriceX96 > 0 &&
+                referenceSqrtPriceX96 > swapData.maxSqrtPriceX96
+            ) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * @notice Get current price from pool
+     */
+
+    function _getCurrentPrice(
+        PoolKey calldata key
+    ) internal view returns (uint160) {
+        PoolId poolId = key.toId();
+        (uint160 sqrtPriceX96, , , ) = StateLibrary.getSlot0(
+            poolManager,
+            poolId
+        );
+        return sqrtPriceX96;
+    }
+/**
+     * @notice Check if price is within acceptable deviation threshold
+     */
+    function _isPriceWithinThreshold(
+        uint160 referencePrice,
+        uint160 currentPrice
+    ) internal pure returns (bool) {
+        if (referencePrice == 0 || currentPrice == 0) return false;
+
+        uint256 priceDiff = referencePrice > currentPrice
+            ? referencePrice - currentPrice
+            : currentPrice - referencePrice;
+
+        uint256 threshold = (uint256(referencePrice) *
+            PRICE_DEVIATION_THRESHOLD) / BASIS_POINTS;
+
+        return priceDiff <= threshold;
+    }
+     /**
+     * @notice Clean up executed swaps from batch
+     */
+    function _cleanupBatch(PoolId poolId) internal {
+        BatchedSwap[] storage batch = poolBatches[poolId];
+        uint256 writeIndex = 0;
+
+        // Compact array by moving unexecuted swaps to front
+        for (uint256 readIndex = 0; readIndex < batch.length; readIndex++) {
+            if (!batch[readIndex].isExecuted) {
+                if (writeIndex != readIndex) {
+                    batch[writeIndex] = batch[readIndex];
+                }
+                writeIndex++;
+            }
+        }
+
+        // Remove executed swaps from the end
+        while (batch.length > writeIndex) {
+            batch.pop();
+        }
+    }
+
+
+    // ========================= Admin Functions =========================
+
+    /**
+     * @notice Authorize/deauthorize batch executors
+     */
+    function setExecutorAuthorization(
+        address executor,
+        bool authorized
+    ) external onlyOwner {
+        authorizedExecutors[executor] = authorized;
+        emit ExecutorAuthorized(executor, authorized);
+    }
+
+    /**
+     * @notice Transfer ownership
+     */
+    function transferOwnership(address newOwner) external onlyOwner {
+        require(newOwner != address(0), "Invalid new owner");
+        owner = newOwner;
+        authorizedExecutors[newOwner] = true;
+    }
+
+    /**
+     * @notice Emergency function to force execute a batch (owner only)
+     */
+    function emergencyExecuteBatch(
+        PoolKey calldata key
+    ) external onlyOwner noReentrant {
+        PoolId poolId = key.toId();
+        BatchState storage batchState = batchStates[poolId];
+
+        require(batchState.batchActive, "No active batch");
+        require(poolBatches[poolId].length > 0, "Empty batch");
+
+        uint160 executionPrice = batchState.referenceSqrtPriceX96;
+        uint256 executedCount = _executeSwapBatch(key, poolId, executionPrice);
+
+        // Update state
+        batchState.batchCount++;
+        batchState.totalQueuedSwaps += executedCount;
+
+        if (poolBatches[poolId].length == 0) {
+            batchState.batchActive = false;
+        } else {
+            batchState.batchStartTime = block.timestamp;
+            batchState.referenceSqrtPriceX96 = _getCurrentPrice(key);
+        }
+
+        emit BatchExecuted(
+            poolId,
+            executedCount,
+            executionPrice,
+            block.timestamp
+        );
+    }
+    // ========================= View Functions =========================
+
+    /**
+     * @notice Get comprehensive batch information for a pool
+     */
+    function getBatchInfo(
+        PoolId poolId
+    )
+        external
+        view
+        returns (
+            uint256 pendingSwaps,
+            uint256 batchStartTime,
+            uint256 timeUntilExecution,
+            uint160 referencePrice,
+            bool batchActive,
+            uint256 batchCount,
+            uint256 totalQueuedSwaps
+        )
+    {
+        BatchState memory state = batchStates[poolId];
+        uint256 currentTime = block.timestamp;
+
+        return (
+            poolBatches[poolId].length,
+            state.batchStartTime,
+            state.batchStartTime + BATCH_INTERVAL > currentTime
+                ? state.batchStartTime + BATCH_INTERVAL - currentTime
+                : 0,
+            state.referenceSqrtPriceX96,
+            state.batchActive,
+            state.batchCount,
+            state.totalQueuedSwaps
+        );
+    }
+
+    /**
+     * @notice Get user's pending swaps count
+     */
+    function getUserPendingSwaps(
+        PoolId poolId,
+        address user
+    ) external view returns (uint256) {
+        return userPendingSwaps[poolId][user];
+    }
+
+    /**
+     * @notice Check if batch can be executed
+     */
+    function canExecuteBatch(PoolId poolId) external view returns (bool) {
+        BatchState memory state = batchStates[poolId];
+        return
+            state.batchActive &&
+            block.timestamp >= state.batchStartTime + BATCH_INTERVAL &&
+            poolBatches[poolId].length > 0;
+    }
+
+    /**
+     * @notice Get batch details with pagination
+     */
+    function getBatchDetails(
+        PoolId poolId,
+        uint256 startIndex,
+        uint256 count
+    ) external view returns (BatchedSwap[] memory) {
+        BatchedSwap[] storage batch = poolBatches[poolId];
+        require(startIndex < batch.length, "Start index out of bounds");
+
+        uint256 endIndex = startIndex + count;
+        if (endIndex > batch.length) {
+            endIndex = batch.length;
+        }
+
+        BatchedSwap[] memory result = new BatchedSwap[](endIndex - startIndex);
+        for (uint256 i = startIndex; i < endIndex; i++) {
+            result[i - startIndex] = batch[i];
+        }
+
+        return result;
+    }
+
+    /**
+     * @notice Get the next batch execution time
+     */
+    function getNextExecutionTime(
+        PoolId poolId
+    ) external view returns (uint256) {
+        BatchState memory state = batchStates[poolId];
+        if (!state.batchActive) {
+            return 0;
+        }
+        return state.batchStartTime + BATCH_INTERVAL;
+    }
+
+    /**
+     * @notice Check if an address is an authorized executor
+     */
+    function isAuthorizedExecutor(
+        address executor
+    ) external view returns (bool) {
+        return authorizedExecutors[executor];
     }
 
     /**
