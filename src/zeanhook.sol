@@ -43,6 +43,7 @@ contract ZeanHook is BaseHook {
     uint256 public constant REVEAL_DURATION = 60 seconds;   
     uint256 public constant MAX_COMMITS_PER_ROUND = 100;    
     uint256 public constant COMMITMENT_BOND = 0.01 ether; 
+    uint256 public constant EXECUTION_GRACE_PERIOD = 10 minutes; 
 
     // Trading round phases
     enum Phase {
@@ -55,7 +56,7 @@ contract ZeanHook is BaseHook {
     struct SwapCommitment {
         bytes32 commitHash;
         address committer;     
-        uint256 bond;         // ETH bond amount
+        uint256 bond;         
         uint256 timestamp;    
         bool revealed;       
         bool executed;        
@@ -77,7 +78,7 @@ contract ZeanHook is BaseHook {
         uint256 phaseStartTime;   
         uint256 commitCount;
         mapping(uint256 => SwapCommitment) commitments;      // Commitment storage
-        mapping(bytes32 => uint256) commitHashToIndex;       // Hash to index mapping
+        mapping(bytes32 => uint256) commitHashToIndex;    
     }
 
     struct PriceData {
@@ -98,7 +99,9 @@ contract ZeanHook is BaseHook {
     mapping(PoolId => VolatilityMetrics) public volatilityMetrics;
     mapping(PoolId => uint256) public lastSwapTimestamp;
 
-    address public owner;
+    // Protocol treasury for slashed bonds (immutable) 
+    //  instead of using an admin to control the slashed bonds
+    address public immutable PROTOCOL_TREASURY;
     mapping(address => bool) public authorizedExecutors;
 
     event SlippageCalculated(
@@ -147,13 +150,9 @@ contract ZeanHook is BaseHook {
         uint256 amount
     );
 
-    modifier onlyOwner() {
-        require(msg.sender == owner, "Not owner");
-        _;
-    }
 
     modifier onlyAuthorizedExecutor() {
-        require(authorizedExecutors[msg.sender] || msg.sender == owner, "Not authorized");
+        require(authorizedExecutors[msg.sender], "Not authorized");
         _;
     }
 
@@ -163,10 +162,11 @@ contract ZeanHook is BaseHook {
      * @dev Inherits from BaseHook which provides core functionality
      */
     constructor(
-        IPoolManager _manager
+        IPoolManager _manager,
+        address _protocolTreasury
     ) BaseHook(_manager) {
-        owner = msg.sender;
-        authorizedExecutors[msg.sender] = true;
+        require(_protocolTreasury != address(0), "Invalid treasury");
+        PROTOCOL_TREASURY = _protocolTreasury;
         _startNewRound();
     }
  
@@ -309,7 +309,6 @@ contract ZeanHook is BaseHook {
             executed: false
         });
 
-        // Store mapping (add 1 to distinguish from default 0)
         round.commitHashToIndex[commitHash] = commitIndex + 1;
         round.commitCount++;
 
@@ -344,14 +343,8 @@ contract ZeanHook is BaseHook {
         require(block.timestamp <= deadline, "Deadline passed");
         require(maxSlippage <= MAX_SLIPPAGE, "Slippage too high");
 
-        bytes32 expectedHash = keccak256(abi.encode(
-            poolKey,
-            swapParams,
-            maxSlippage,  
-            nonce,
-            deadline
-        ));
-        require(expectedHash == commitment.commitHash, "Invalid reveal - hash mismatch");
+        bytes32 expectedHash = keccak256(abi.encode(poolKey, swapParams, maxSlippage, nonce, deadline));
+        require(expectedHash == commitment.commitHash, "Invalid reveal");
 
         commitment.revealed = true;
         
@@ -370,14 +363,19 @@ contract ZeanHook is BaseHook {
 
     //== EXECUTE PHASE ==//
 
+    
     /**
-     * @notice Execute all revealed swaps in batch
-     * @dev Only authorized executors can call this to ensure fair execution
+     * @notice Execute all revealed swaps - ANYONE can call this function
+     * @dev No authorization required - fully decentralized execution
      */
 
-    function executeRevealedSwaps() external onlyAuthorizedExecutor {
+    function executeRevealedSwaps() external {
         CommitRound storage round = commitRounds[currentRoundId];
         require(round.currentPhase == Phase.Execute, "Not in execute phase");
+
+        // Optional: Add grace period for fair execution
+        uint256 timeInExecutePhase = block.timestamp - round.phaseStartTime;
+        require(timeInExecutePhase >= EXECUTION_GRACE_PERIOD, "Grace period not over");
 
         RevealedSwap[] storage swaps = revealedSwaps[currentRoundId];
         
@@ -386,19 +384,19 @@ contract ZeanHook is BaseHook {
                 bool success = _executeSwap(swaps[i]);
                 swaps[i].executed = true;
                 
-                emit SwapExecuted(
-                    currentRoundId, 
-                    swaps[i].swapper, 
-                    swaps[i].poolKey.toId(),
-                    success
-                );
+                emit SwapExecuted(currentRoundId, swaps[i].swapper, swaps[i].poolKey.toId(), success);
             }
         }
 
         _finalizeRound();
     }
 
-     function advancePhase() external {
+    /**
+     * @notice Advance to the next phase - ANYONE can call this
+     * @dev Fully automated phase transitions based on time
+     */
+
+    function advancePhase() external {
         CommitRound storage round = commitRounds[currentRoundId];
         uint256 timeInPhase = block.timestamp - round.phaseStartTime;
 
@@ -608,8 +606,8 @@ contract ZeanHook is BaseHook {
         return "";
     }
 
-        /**
-     * @dev Finalize the current round and start a new one
+      /**
+     * @dev Decentralized bond handling - no admin discretion
      */
     function _finalizeRound() internal {
         CommitRound storage round = commitRounds[currentRoundId];
@@ -618,8 +616,11 @@ contract ZeanHook is BaseHook {
             SwapCommitment storage commitment = round.commitments[i];
             
             if (!commitment.revealed) {
+                // Automatically send slashed bonds to protocol treasury
+                payable(PROTOCOL_TREASURY).transfer(commitment.bond);
                 emit BondSlashed(currentRoundId, i, commitment.committer, commitment.bond);
             } else {
+                // Return bond to users who revealed their commitments
                 payable(commitment.committer).transfer(commitment.bond);
                 emit BondReturned(currentRoundId, commitment.committer, commitment.bond);
             }
@@ -627,6 +628,7 @@ contract ZeanHook is BaseHook {
 
         _startNewRound();
     }
+
 
     /**
      * @dev Initialize a new trading round
@@ -658,23 +660,17 @@ contract ZeanHook is BaseHook {
         } else if (phase == Phase.Reveal) {
             timeRemaining = timeInPhase >= REVEAL_DURATION ? 0 : REVEAL_DURATION - timeInPhase;
         } else {
-            timeRemaining = 0; // Execute phase has no time limit
+            timeRemaining = 0;
         }
     }
 
     function getCommitment(uint256 roundId, uint256 commitIndex) 
-        external 
-        view 
-        returns (SwapCommitment memory) 
-    {
+        external view returns (SwapCommitment memory) {
         return commitRounds[roundId].commitments[commitIndex];
     }
 
     function getRevealedSwaps(uint256 roundId) 
-        external 
-        view 
-        returns (RevealedSwap[] memory) 
-    {
+        external view returns (RevealedSwap[] memory) {
         return revealedSwaps[roundId];
     }
 
@@ -684,26 +680,6 @@ contract ZeanHook is BaseHook {
 
     function isCommitmentHashUsed(bytes32 commitHash) external view returns (bool) {
         return commitRounds[currentRoundId].commitHashToIndex[commitHash] != 0;
-    }
-
-    //== ADMIN FUNCTIONS ==//
-
-    /**
-     * @notice Add or remove authorized executors
-     */
-    function setAuthorizedExecutor(address executor, bool authorized) external onlyOwner {
-        authorizedExecutors[executor] = authorized;
-    }
-
-    
-    function emergencyWithdraw() external onlyOwner {
-        payable(owner).transfer(address(this).balance);
-    }
-
-
-    function transferOwnership(address newOwner) external onlyOwner {
-        require(newOwner != address(0), "Zero address");
-        owner = newOwner;
     }
 
         //== UTILITY FUNCTIONS ==//
