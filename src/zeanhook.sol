@@ -52,6 +52,53 @@ contract ZeanHook is BaseHook {
         bytes hookData;
     }
 
+ commit-reveal
+    /**
+     * Parameters for commit-reveal
+     */
+    uint256 public constant COMMIT_DURATION = 30 seconds;  
+    uint256 public constant REVEAL_DURATION = 60 seconds;   
+    uint256 public constant MAX_COMMITS_PER_ROUND = 100;    
+    uint256 public constant COMMITMENT_BOND = 0.01 ether; 
+    uint256 public constant EXECUTION_GRACE_PERIOD = 10 minutes; 
+
+    // Trading round phases
+    enum Phase {
+        Commit,   
+        Reveal,    
+        Execute,  
+        Cooldown   
+    }
+
+    struct SwapCommitment {
+        bytes32 commitHash;
+        address committer;     
+        uint256 bond;         
+        uint256 timestamp;    
+        bool revealed;       
+        bool executed;        
+    }
+
+    struct RevealedSwap {
+        PoolKey poolKey;      
+        SwapParams swapParams; 
+        address swapper;     
+        uint256 maxSlippage;  
+        uint256 nonce;        
+        uint256 deadline;     
+        bool executed;        
+    }
+
+    struct CommitRound {
+        uint256 roundId;           
+        Phase currentPhase;
+        uint256 phaseStartTime;   
+        uint256 commitCount;
+        mapping(uint256 => SwapCommitment) commitments;      // Commitment storage
+        mapping(bytes32 => uint256) commitHashToIndex;    
+    }
+
+
     struct BatchState {
         uint256 batchStartTime;
         uint160 referenceSqrtPriceX96;
@@ -59,6 +106,7 @@ contract ZeanHook is BaseHook {
         uint256 batchCount;
         uint256 totalQueuedSwaps;
     }
+ main
     struct PriceData {
         uint160 sqrtPriceX96;
         uint256 timestamp;
@@ -70,12 +118,20 @@ contract ZeanHook is BaseHook {
         uint256 sampleCount;
     }
 
+    uint256 public currentRoundId;
+    mapping(uint256 => CommitRound) public commitRounds;
+    mapping(uint256 => RevealedSwap[]) public revealedSwaps;
     mapping(PoolId => PriceData[]) public priceHistory;
     mapping(PoolId => VolatilityMetrics) public volatilityMetrics;
     mapping(PoolId => uint256) public lastSwapTimestamp;
     mapping(PoolId => BatchedSwap[]) public poolBatches;
     mapping(PoolId => BatchState) public batchStates;
     mapping(PoolId => mapping(address => uint256)) public userPendingSwaps;
+    mapping(address => bool) public authorizedExecutors;
+
+    // Protocol treasury for slashed bonds (immutable) 
+    //  instead of using an admin to control the slashed bonds
+    address public immutable PROTOCOL_TREASURY;
     mapping(address => bool) public authorizedExecutors;
 
     event SlippageCalculated(
@@ -90,6 +146,45 @@ contract ZeanHook is BaseHook {
         uint160 sqrtPriceX96,
         uint256 timestamp
     );
+
+ commit-reveal
+    // Events for commit-reveal
+    event CommitPhaseStarted(uint256 indexed roundId, uint256 startTime);
+    event RevealPhaseStarted(uint256 indexed roundId, uint256 startTime);
+    event ExecutePhaseStarted(uint256 indexed roundId, uint256 startTime);
+    event SwapCommitted(
+        uint256 indexed roundId, 
+        uint256 commitIndex, 
+        address indexed committer, 
+        bytes32 commitHash
+    );
+    event SwapRevealed(
+        uint256 indexed roundId, 
+        uint256 commitIndex, 
+        address indexed swapper
+    );
+    event SwapExecuted(
+        uint256 indexed roundId, 
+        address indexed swapper, 
+        PoolId indexed poolId,
+        bool success
+    );
+    event BondSlashed(
+        uint256 indexed roundId, 
+        uint256 commitIndex, 
+        address indexed committer, 
+        uint256 amount
+    );
+    event BondReturned(
+        uint256 indexed roundId, 
+        address indexed committer, 
+        uint256 amount
+    );
+
+
+    modifier onlyAuthorizedExecutor() {
+        require(authorizedExecutors[msg.sender], "Not authorized");
+        _;
 
 
    
@@ -147,6 +242,7 @@ contract ZeanHook is BaseHook {
         _executing = true;
         _;
         _executing = false;
+ main
     }
 
      /**
@@ -155,12 +251,22 @@ contract ZeanHook is BaseHook {
      * @dev Inherits from BaseHook which provides core functionality
      */
     constructor(
+ commit-reveal
+        IPoolManager _manager,
+        address _protocolTreasury
+    ) BaseHook(_manager) {
+        require(_protocolTreasury != address(0), "Invalid treasury");
+        PROTOCOL_TREASURY = _protocolTreasury;
+        _startNewRound();
+    }
+
         IPoolManager _manager
     ) BaseHook(_manager) {
         owner = msg.sender;
         authorizedExecutors[msg.sender] = true;
     }
     
+ main
  
 	// Set up hook permissions to return `true`
     function getHookPermissions()
@@ -720,6 +826,139 @@ contract ZeanHook is BaseHook {
         return adjustedSlippage;
     }
 
+     //== COMMIT PHASE ==//
+
+    /**
+     * @notice Submit a commitment to swap without revealing parameters
+     * @param commitHash Keccak256 hash of abi.encode(poolKey, swapParams, maxSlippage, nonce, deadline)
+     * @dev Users must include the commitment bond to prevent spam attacks
+     */
+
+    function commitSwap(bytes32 commitHash) external payable {
+        require(msg.value >= COMMITMENT_BOND, "Insufficient bond");
+        
+        CommitRound storage round = commitRounds[currentRoundId];
+        require(round.currentPhase == Phase.Commit, "Not in commit phase");
+        require(round.commitCount < MAX_COMMITS_PER_ROUND, "Max commits reached");
+        require(round.commitHashToIndex[commitHash] == 0, "Duplicate commit");
+
+        uint256 commitIndex = round.commitCount;
+        round.commitments[commitIndex] = SwapCommitment({
+            commitHash: commitHash,
+            committer: msg.sender,
+            bond: msg.value,
+            timestamp: block.timestamp,
+            revealed: false,
+            executed: false
+        });
+
+        round.commitHashToIndex[commitHash] = commitIndex + 1;
+        round.commitCount++;
+
+        emit SwapCommitted(currentRoundId, commitIndex, msg.sender, commitHash);
+    }
+
+    function createCommitmentHash(
+        PoolKey calldata poolKey,
+        SwapParams calldata swapParams,
+        uint256 maxSlippage,
+        uint256 nonce,
+        uint256 deadline
+    ) external pure returns (bytes32) {
+        return keccak256(abi.encode(poolKey, swapParams, maxSlippage, nonce, deadline));
+    }
+
+    function revealSwap(
+        uint256 commitIndex,
+        PoolKey calldata poolKey,
+        SwapParams calldata swapParams,
+        uint256 maxSlippage,
+        uint256 nonce,
+        uint256 deadline
+    ) external {
+        CommitRound storage round = commitRounds[currentRoundId];
+        require(round.currentPhase == Phase.Reveal, "Not in reveal phase");
+        require(commitIndex < round.commitCount, "Invalid commit index");
+        
+        SwapCommitment storage commitment = round.commitments[commitIndex];
+        require(commitment.committer == msg.sender, "Not your commitment");
+        require(!commitment.revealed, "Already revealed");
+        require(block.timestamp <= deadline, "Deadline passed");
+        require(maxSlippage <= MAX_SLIPPAGE, "Slippage too high");
+
+        bytes32 expectedHash = keccak256(abi.encode(poolKey, swapParams, maxSlippage, nonce, deadline));
+        require(expectedHash == commitment.commitHash, "Invalid reveal");
+
+        commitment.revealed = true;
+        
+        revealedSwaps[currentRoundId].push(RevealedSwap({
+            poolKey: poolKey,
+            swapParams: swapParams,
+            swapper: msg.sender,
+            maxSlippage: maxSlippage,
+            nonce: nonce,
+            deadline: deadline,
+            executed: false
+        }));
+
+        emit SwapRevealed(currentRoundId, commitIndex, msg.sender);
+    }
+
+    //== EXECUTE PHASE ==//
+
+    
+    /**
+     * @notice Execute all revealed swaps - ANYONE can call this function
+     * @dev No authorization required - fully decentralized execution
+     */
+
+    function executeRevealedSwaps() external {
+        CommitRound storage round = commitRounds[currentRoundId];
+        require(round.currentPhase == Phase.Execute, "Not in execute phase");
+
+        // Optional: Add grace period for fair execution
+        uint256 timeInExecutePhase = block.timestamp - round.phaseStartTime;
+        require(timeInExecutePhase >= EXECUTION_GRACE_PERIOD, "Grace period not over");
+
+        RevealedSwap[] storage swaps = revealedSwaps[currentRoundId];
+        
+        for (uint256 i = 0; i < swaps.length; i++) {
+            if (!swaps[i].executed && block.timestamp <= swaps[i].deadline) {
+                bool success = _executeSwap(swaps[i]);
+                swaps[i].executed = true;
+                
+                emit SwapExecuted(currentRoundId, swaps[i].swapper, swaps[i].poolKey.toId(), success);
+            }
+        }
+
+        _finalizeRound();
+    }
+
+    /**
+     * @notice Advance to the next phase - ANYONE can call this
+     * @dev Fully automated phase transitions based on time
+     */
+
+    function advancePhase() external {
+        CommitRound storage round = commitRounds[currentRoundId];
+        uint256 timeInPhase = block.timestamp - round.phaseStartTime;
+
+        if (round.currentPhase == Phase.Commit && timeInPhase >= COMMIT_DURATION) {
+            round.currentPhase = Phase.Reveal;
+            round.phaseStartTime = block.timestamp;
+            emit RevealPhaseStarted(currentRoundId, block.timestamp);
+            
+        } else if (round.currentPhase == Phase.Reveal && timeInPhase >= REVEAL_DURATION) {
+            round.currentPhase = Phase.Execute;
+            round.phaseStartTime = block.timestamp;
+            emit ExecutePhaseStarted(currentRoundId, block.timestamp);
+            
+        } else if (round.currentPhase == Phase.Execute) {
+            revert("Call executeRevealedSwaps to complete this phase");
+        }
+    }
+
+
     /**
      * @dev Calculate current volatility based on price history
      * @param poolId The pool identifier
@@ -818,6 +1057,17 @@ contract ZeanHook is BaseHook {
     }
 
     //== Internal functions ==//
+    /**
+     * @dev Execute a single swap through the pool manager using unlock/lock pattern
+     */
+    function _executeSwap(RevealedSwap memory swap) internal returns (bool success) {
+        try poolManager.unlock(abi.encode(swap)) {
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
     function _recordPriceData(PoolId poolId, uint160 sqrtPriceX96) internal {
         PriceData[] storage history = priceHistory[poolId];
         
@@ -884,5 +1134,104 @@ contract ZeanHook is BaseHook {
         }
         
         return y;
+    }
+
+     /**
+     * @dev Callback function called by poolManager.unlock()
+     */
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+        require(msg.sender == address(poolManager), "Only pool manager");
+        
+        RevealedSwap memory swap = abi.decode(data, (RevealedSwap));
+        
+        poolManager.swap(swap.poolKey, swap.swapParams, "");
+        
+        return "";
+    }
+
+      /**
+     * @dev Decentralized bond handling - no admin discretion
+     */
+    function _finalizeRound() internal {
+        CommitRound storage round = commitRounds[currentRoundId];
+        
+        for (uint256 i = 0; i < round.commitCount; i++) {
+            SwapCommitment storage commitment = round.commitments[i];
+            
+            if (!commitment.revealed) {
+                // Automatically send slashed bonds to protocol treasury
+                payable(PROTOCOL_TREASURY).transfer(commitment.bond);
+                emit BondSlashed(currentRoundId, i, commitment.committer, commitment.bond);
+            } else {
+                // Return bond to users who revealed their commitments
+                payable(commitment.committer).transfer(commitment.bond);
+                emit BondReturned(currentRoundId, commitment.committer, commitment.bond);
+            }
+        }
+
+        _startNewRound();
+    }
+
+
+    /**
+     * @dev Initialize a new trading round
+     */
+    function _startNewRound() internal {
+        currentRoundId++;
+        CommitRound storage newRound = commitRounds[currentRoundId];
+        newRound.roundId = currentRoundId;
+        newRound.currentPhase = Phase.Commit;
+        newRound.phaseStartTime = block.timestamp;
+        newRound.commitCount = 0;
+
+        emit CommitPhaseStarted(currentRoundId, block.timestamp);
     }	
+
+    //== VIEW FUNCTIONS ==//
+
+    /**
+     * @notice Get the current phase and time remaining
+     */
+    function getCurrentPhase() external view returns (Phase phase, uint256 timeRemaining) {
+        CommitRound storage round = commitRounds[currentRoundId];
+        phase = round.currentPhase;
+        
+        uint256 timeInPhase = block.timestamp - round.phaseStartTime;
+        
+        if (phase == Phase.Commit) {
+            timeRemaining = timeInPhase >= COMMIT_DURATION ? 0 : COMMIT_DURATION - timeInPhase;
+        } else if (phase == Phase.Reveal) {
+            timeRemaining = timeInPhase >= REVEAL_DURATION ? 0 : REVEAL_DURATION - timeInPhase;
+        } else {
+            timeRemaining = 0;
+        }
+    }
+
+    function getCommitment(uint256 roundId, uint256 commitIndex) 
+        external view returns (SwapCommitment memory) {
+        return commitRounds[roundId].commitments[commitIndex];
+    }
+
+    function getRevealedSwaps(uint256 roundId) 
+        external view returns (RevealedSwap[] memory) {
+        return revealedSwaps[roundId];
+    }
+
+    function getCurrentCommitCount() external view returns (uint256) {
+        return commitRounds[currentRoundId].commitCount;
+    }
+
+    function isCommitmentHashUsed(bytes32 commitHash) external view returns (bool) {
+        return commitRounds[currentRoundId].commitHashToIndex[commitHash] != 0;
+    }
+
+        //== UTILITY FUNCTIONS ==//
+
+    function getContractBalance() external view returns (uint256) {
+        return address(this).balance;
+    }
+
+
+    receive() external payable {}
+
 }
