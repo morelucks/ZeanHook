@@ -765,6 +765,22 @@ contract ZeanHook is BaseHook {
         
         return volatility;
     }
+/// @title A title that should describe the contract/interface
+/// @author The name of the author
+/// @notice Explain to an end user what this does
+/// @dev Explain to a developer any extra details
+
+
+
+
+/// @title A title that should describe the contract/interface
+/// @author The name of the author
+/// @notice Explain to an end user what this does
+/// @dev Explain to a developer any extra details
+
+
+
+
 
     /**
      * @dev Get the recommended slippage for a pool
