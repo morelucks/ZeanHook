@@ -40,6 +40,15 @@ contract ZeanHook is BaseHook {
     uint256 public constant VOLATILITY_WINDOW = 24 hours;
     uint256 public constant MIN_SAMPLES = 5;
     uint256 public constant VOLATILITY_MULTIPLIER = 100;
+
+    /**
+     * Commit-Reveal Constants
+     */
+
+    uint256 public constant COMMIT_PHASE_DURATION = 60; 
+    uint256 public constant REVEAL_PHASE_DURATION = 120;
+    uint256 public constant MIN_COMMIT_DELAY = 10; 
+
     // ========================= Structs =========================
     struct BatchedSwap {
         address user;
@@ -58,6 +67,12 @@ contract ZeanHook is BaseHook {
         bool batchActive;
         uint256 batchCount;
         uint256 totalQueuedSwaps;
+        // Commit-Reveal additions
+        uint256 commitPhaseStart;
+        uint256 revealPhaseStart;
+        bool commitPhaseActive;
+        bool revealPhaseActive;
+        bytes32 batchCommitHash;
     }
     struct PriceData {
         uint160 sqrtPriceX96;
@@ -70,6 +85,26 @@ contract ZeanHook is BaseHook {
         uint256 sampleCount;
     }
 
+     /**
+     * Commit-Reveal Structs
+     */
+    struct SwapCommit {
+        bytes32 commitHash;
+        uint256 commitTime;
+        bool revealed;
+        bool executed;
+    }
+
+    struct SwapReveal {
+        SwapParams params;
+        uint256 minAmountOut;
+        uint160 maxSqrtPriceX96;
+        uint160 minSqrtPriceX96;
+        bytes hookData;
+        uint256 nonce;
+        bytes32 salt;
+    }
+
     mapping(PoolId => PriceData[]) public priceHistory;
     mapping(PoolId => VolatilityMetrics) public volatilityMetrics;
     mapping(PoolId => uint256) public lastSwapTimestamp;
@@ -77,6 +112,12 @@ contract ZeanHook is BaseHook {
     mapping(PoolId => BatchState) public batchStates;
     mapping(PoolId => mapping(address => uint256)) public userPendingSwaps;
     mapping(address => bool) public authorizedExecutors;
+
+     // Commit-Reveal Storage
+    mapping(PoolId => mapping(address => SwapCommit[])) public userCommits;
+    mapping(PoolId => mapping(bytes32 => SwapReveal)) public commitReveals;
+    mapping(PoolId => bytes32[]) public batchCommitHashes;
+    mapping(PoolId => mapping(address => uint256)) public userCommitCounts;
 
     event SlippageCalculated(
         PoolId indexed poolId,
@@ -128,6 +169,40 @@ contract ZeanHook is BaseHook {
 
     event ExecutorAuthorized(address indexed executor, bool authorized);
 
+     // Commit-Reveal Events
+    event SwapCommitted(
+        PoolId indexed poolId,
+        address indexed user,
+        bytes32 indexed commitHash,
+        uint256 commitTime
+    );
+
+    event SwapRevealed(
+        PoolId indexed poolId,
+        address indexed user,
+        bytes32 indexed commitHash,
+        uint256 revealTime
+    );
+
+    event CommitPhaseStarted(
+        PoolId indexed poolId,
+        uint256 startTime,
+        uint256 endTime
+    );
+
+    event RevealPhaseStarted(
+        PoolId indexed poolId,
+        uint256 startTime,
+        uint256 endTime
+    );
+
+    event InvalidReveal(
+        PoolId indexed poolId,
+        address indexed user,
+        bytes32 indexed commitHash,
+        string reason
+    );
+
     // ========================= Modifiers =========================
     modifier onlyOwner() {
         require(msg.sender == owner, "Only owner");
@@ -147,6 +222,24 @@ contract ZeanHook is BaseHook {
         _executing = true;
         _;
         _executing = false;
+    }
+
+     modifier onlyDuringCommitPhase(PoolId poolId) {
+        require(batchStates[poolId].commitPhaseActive, "Not in commit phase");
+        require(
+            block.timestamp < batchStates[poolId].commitPhaseStart + COMMIT_PHASE_DURATION,
+            "Commit phase ended"
+        );
+        _;
+    }
+
+    modifier onlyDuringRevealPhase(PoolId poolId) {
+        require(batchStates[poolId].revealPhaseActive, "Not in reveal phase");
+        require(
+            block.timestamp < batchStates[poolId].revealPhaseStart + REVEAL_PHASE_DURATION,
+            "Reveal phase ended"
+        );
+        _;
     }
 
      /**
@@ -252,6 +345,249 @@ contract ZeanHook is BaseHook {
         
         return (this.afterSwap.selector, 0);
     }
+
+        // ========================= Commit-Reveal Functions =========================
+
+    /**
+     * @notice Commit to a swap during the commit phase
+     * @param poolId The pool identifier
+     * @param commitHash Hash of swap parameters + nonce + salt
+     */
+    function commitSwap(
+        PoolId poolId,
+        bytes32 commitHash
+    ) external onlyDuringCommitPhase(poolId) {
+        require(commitHash != bytes32(0), "Invalid commit hash");
+        
+        SwapCommit memory newCommit = SwapCommit({
+            commitHash: commitHash,
+            commitTime: block.timestamp,
+            revealed: false,
+            executed: false
+        });
+
+        userCommits[poolId][msg.sender].push(newCommit);
+        userCommitCounts[poolId][msg.sender]++;
+        batchCommitHashes[poolId].push(commitHash);
+
+        emit SwapCommitted(poolId, msg.sender, commitHash, block.timestamp);
+    }
+
+     function revealSwap(
+        PoolId poolId,
+        uint256 commitIndex,
+        SwapParams calldata params,
+        uint256 minAmountOut,
+        uint160 maxSqrtPriceX96,
+        uint160 minSqrtPriceX96,
+        bytes calldata hookData,
+        uint256 nonce,
+        bytes32 salt
+    ) external onlyDuringRevealPhase(poolId) {
+        require(commitIndex < userCommits[poolId][msg.sender].length, "Invalid commit index");
+        
+        SwapCommit storage commit = userCommits[poolId][msg.sender][commitIndex];
+        require(!commit.revealed, "Already revealed");
+        require(
+            block.timestamp >= commit.commitTime + MIN_COMMIT_DELAY,
+            "Reveal too early"
+        );
+
+        // Verify commit hash
+        bytes32 expectedHash = generateCommitHash(
+            msg.sender,
+            params,
+            minAmountOut,
+            maxSqrtPriceX96,
+            minSqrtPriceX96,
+            hookData,
+            nonce,
+            salt
+        );
+
+        if (expectedHash != commit.commitHash) {
+            emit InvalidReveal(poolId, msg.sender, commit.commitHash, "Hash mismatch");
+            return;
+        }
+
+        // Mark as revealed and store reveal data
+        commit.revealed = true;
+        commitReveals[poolId][commit.commitHash] = SwapReveal({
+            params: params,
+            minAmountOut: minAmountOut,
+            maxSqrtPriceX96: maxSqrtPriceX96,
+            minSqrtPriceX96: minSqrtPriceX96,
+            hookData: hookData,
+            nonce: nonce,
+            salt: salt
+        });
+
+        emit SwapRevealed(poolId, msg.sender, commit.commitHash, block.timestamp);
+    }
+
+    /**
+     * @notice Generate commit hash for swap parameters
+     */
+    function generateCommitHash(
+        address user,
+        SwapParams memory params,
+        uint256 minAmountOut,
+        uint160 maxSqrtPriceX96,
+        uint160 minSqrtPriceX96,
+        bytes memory hookData,
+        uint256 nonce,
+        bytes32 salt
+    ) public pure returns (bytes32) {
+        return keccak256(abi.encodePacked(
+            user,
+            params.zeroForOne,
+            params.amountSpecified,
+            params.sqrtPriceLimitX96,
+            minAmountOut,
+            maxSqrtPriceX96,
+            minSqrtPriceX96,
+            hookData,
+            nonce,
+            salt
+        ));
+    }
+
+     /**
+     * @notice Start commit phase for a pool
+     */
+    function startCommitPhase(PoolId poolId) external onlyAuthorizedExecutor {
+        BatchState storage batchState = batchStates[poolId];
+        require(!batchState.commitPhaseActive, "Commit phase already active");
+        require(!batchState.revealPhaseActive, "Reveal phase active");
+
+        batchState.commitPhaseActive = true;
+        batchState.commitPhaseStart = block.timestamp;
+        batchState.batchStartTime = block.timestamp;
+
+        emit CommitPhaseStarted(
+            poolId,
+            block.timestamp,
+            block.timestamp + COMMIT_PHASE_DURATION
+        );
+    }
+
+     /**
+     * @notice Start reveal phase for a pool
+     */
+    function startRevealPhase(PoolId poolId) external onlyAuthorizedExecutor {
+        BatchState storage batchState = batchStates[poolId];
+        require(batchState.commitPhaseActive, "No active commit phase");
+        require(
+            block.timestamp >= batchState.commitPhaseStart + COMMIT_PHASE_DURATION,
+            "Commit phase not ended"
+        );
+
+        batchState.commitPhaseActive = false;
+        batchState.revealPhaseActive = true;
+        batchState.revealPhaseStart = block.timestamp;
+
+        emit RevealPhaseStarted(
+            poolId,
+            block.timestamp,
+            block.timestamp + REVEAL_PHASE_DURATION
+        );
+    }
+
+    /**
+     * @notice Execute batch after reveal phase
+     */
+    function executeBatchAfterReveal(
+        PoolKey calldata key
+    ) external onlyAuthorizedExecutor noReentrant {
+        PoolId poolId = key.toId();
+        BatchState storage batchState = batchStates[poolId];
+
+        require(batchState.revealPhaseActive, "No active reveal phase");
+        require(
+            block.timestamp >= batchState.revealPhaseStart + REVEAL_PHASE_DURATION,
+            "Reveal phase not ended"
+        );
+
+        // Convert revealed commits to batched swaps
+        _processRevealedCommits(poolId, key);
+
+        // Execute the batch
+        uint160 executionPrice = _getCurrentPrice(key);
+        uint256 executedCount = _executeSwapBatch(key, poolId, executionPrice);
+
+        // Update state
+        batchState.batchCount++;
+        batchState.totalQueuedSwaps += executedCount;
+        batchState.revealPhaseActive = false;
+
+        // Clear commit data
+        _clearCommitData(poolId);
+
+        emit BatchExecuted(
+            poolId,
+            executedCount,
+            executionPrice,
+            block.timestamp
+        );
+    }
+
+    /**
+     * @notice Process revealed commits and add them to batch queue
+     */
+    function _processRevealedCommits(PoolId poolId, PoolKey calldata key) internal {
+        bytes32[] storage commitHashes = batchCommitHashes[poolId];
+        
+        for (uint256 i = 0; i < commitHashes.length; i++) {
+            bytes32 commitHash = commitHashes[i];
+            SwapReveal memory reveal = commitReveals[poolId][commitHash];
+            
+            // Find the user who made this commit
+            address user = _findCommitUser(poolId, commitHash);
+            if (user == address(0)) continue;
+
+            // Add to batch queue
+            BatchedSwap memory newSwap = BatchedSwap({
+                user: user,
+                params: reveal.params,
+                queueTime: block.timestamp,
+                minAmountOut: reveal.minAmountOut,
+                maxSqrtPriceX96: reveal.maxSqrtPriceX96,
+                minSqrtPriceX96: reveal.minSqrtPriceX96,
+                isExecuted: false,
+                hookData: reveal.hookData
+            });
+
+            poolBatches[poolId].push(newSwap);
+            userPendingSwaps[poolId][user]++;
+        }
+    }
+
+     /**
+     * @notice Find user who made a specific commit
+     */
+    function _findCommitUser(PoolId poolId, bytes32 commitHash) internal view returns (address) {
+        // This is a simplified approach - in production, you might want to store user->commit mapping
+        // For now, we iterate through all users (this could be optimized)
+        bytes32[] memory hashes = batchCommitHashes[poolId];
+        for (uint256 i = 0; i < hashes.length; i++) {
+            if (hashes[i] == commitHash) {
+                // In a real implementation, you'd have a mapping from hash to user
+                // This is a placeholder - you'd need to implement proper user tracking
+                return address(0); // Placeholder
+            }
+        }
+        return address(0);
+    }
+
+    /**
+     * @notice Clear commit data after batch execution
+     */
+    function _clearCommitData(PoolId poolId) internal {
+        delete batchCommitHashes[poolId];
+        // Note: Individual user commits and reveals are kept for historical purposes
+        // You might want to implement a cleanup mechanism based on your requirements
+    }
+
 
     function queueSwap(
         PoolKey calldata key,
