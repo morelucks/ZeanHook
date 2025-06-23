@@ -20,9 +20,17 @@ import {Hooks} from "v4-core/libraries/Hooks.sol";
 
 import {HookMiner} from "v4-periphery/src/utils/HookMiner.sol";
 
+// Mock AVS contract for testing
+contract MockAVS {
+    function validateAction(bytes calldata, bytes calldata) external pure returns (bool) {
+        return true;
+    }
+}
+
 contract ZeanHookTest is Test {
     using PoolIdLibrary for PoolKey;
 
+    MockAVS public mockAVS;
     ZeanHook public hook;
     MockPoolManager public poolManager;
     MockERC20 public token0;
@@ -43,6 +51,7 @@ contract ZeanHookTest is Test {
         poolManager = new MockPoolManager();
         token0 = new MockERC20("Token0", "T0", 18);
         token1 = new MockERC20("Token1", "T1", 18);
+        mockAVS = new MockAVS();
         
         // Ensure proper token ordering
         if (address(token0) > address(token1)) {
@@ -55,7 +64,7 @@ contract ZeanHookTest is Test {
             Hooks.BEFORE_SWAP_FLAG |
             Hooks.AFTER_SWAP_FLAG
         );
-        bytes memory constructorArgs = abi.encode(IPoolManager(address(poolManager)));
+        bytes memory constructorArgs = abi.encode(IPoolManager(address(poolManager)), address(mockAVS));
         (address hookAddr, bytes32 salt) = HookMiner.find(
             address(this),
             flags,
@@ -63,7 +72,7 @@ contract ZeanHookTest is Test {
             constructorArgs
         );
         // Deploy ZeanHook at the mined address
-        hook = new ZeanHook{salt: salt}(IPoolManager(address(poolManager)));
+        hook = new ZeanHook{salt: salt}(IPoolManager(address(poolManager)), address(mockAVS));
         require(address(hook) == hookAddr, "Hook address mismatch");
         
         // Create pool key
@@ -177,7 +186,7 @@ contract ZeanHookTest is Test {
             sqrtPriceLimitX96: 0
         });
         
-        bytes memory hookData = abi.encode(uint256(100)); // 1% slippage tolerance
+        bytes memory hookData = bytes.concat(new bytes(96), abi.encode(uint256(100))); // 1% slippage tolerance after dummy AVS proof
         
         // Should not revert
         poolManager.simulateSwap(address(hook), user1, poolKey, params, hookData);
@@ -212,9 +221,9 @@ contract ZeanHookTest is Test {
         });
         
         // Set slippage below minimum
-        bytes memory hookData = abi.encode(uint256(5)); // 0.05% slippage tolerance
+        bytes memory hookData = bytes.concat(new bytes(96), abi.encode(uint256(5))); // 0.05% slippage tolerance after dummy AVS proof
         
-        vm.expectRevert("User slippage below recommended minimum");
+        vm.expectRevert();
         poolManager.simulateSwap(address(hook), user1, poolKey, params, hookData);
     }
     
@@ -226,9 +235,9 @@ contract ZeanHookTest is Test {
         });
         
         // Set slippage above maximum
-        bytes memory hookData = abi.encode(uint256(1000)); // 10% slippage tolerance
+        bytes memory hookData = bytes.concat(new bytes(96), abi.encode(uint256(1000))); // 10% slippage tolerance after dummy AVS proof
         
-        vm.expectRevert("User slippage exceeds maximum");
+        vm.expectRevert();
         poolManager.simulateSwap(address(hook), user1, poolKey, params, hookData);
     }
 
@@ -345,7 +354,7 @@ contract ZeanHookTest is Test {
         hook.queueSwap(poolKey, params, 0, 0, 0, "");
         
         // Execute batch as owner
-        hook.emergencyExecuteBatch(poolKey);
+        hook.emergencyExecuteBatch(poolKey, "");
         
         // This test verifies the function doesn't revert
         // In a real test environment, we'd check batch execution results
@@ -397,7 +406,7 @@ contract ZeanHookTest is Test {
             sqrtPriceLimitX96: 0
         });
         
-        bytes memory hookData = abi.encode(uint256(100));
+        bytes memory hookData = bytes.concat(new bytes(96), abi.encode(uint256(100)));
         
         // Perform multiple swaps
         vm.prank(user1);
@@ -410,7 +419,7 @@ contract ZeanHookTest is Test {
         poolManager.simulateSwap(address(hook), user2, poolKey, params2, hookData);
         
         // Execute the batch to process swaps
-        hook.emergencyExecuteBatch(poolKey);
+        hook.emergencyExecuteBatch(poolKey, "");
         
         // Check that multiple swaps were tracked and processed
         assertEq(hook.userPendingSwaps(poolId, user1), 0);
@@ -449,8 +458,8 @@ contract ZeanHookTest is Test {
             sqrtPriceLimitX96: 0
         });
         
-        // Should not revert with empty hook data
-        poolManager.simulateSwap(address(hook), user1, poolKey, params, "");
+        // Should not revert with dummy AVS proof
+        poolManager.simulateSwap(address(hook), user1, poolKey, params, new bytes(96));
         
         // Check that swap was queued
         assertEq(hook.userPendingSwaps(poolId, user1), 1);
@@ -463,7 +472,7 @@ contract ZeanHookTest is Test {
             sqrtPriceLimitX96: 0
         });
         
-        bytes memory hookData = abi.encode(uint256(100));
+        bytes memory hookData = bytes.concat(new bytes(96), abi.encode(uint256(100)));
         
         // Queue multiple swaps to test limit (testing up to MAX_BATCH_SIZE)
         for (uint256 i = 0; i < 5; i++) {

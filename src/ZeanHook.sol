@@ -17,6 +17,10 @@ import {BatchManager} from "./libraries/BatchManager.sol";
 import {CommitRevealManager} from "./libraries/CommitRevealManager.sol";
 import {IZeanHook} from "./interfaces/IZeanHook.sol";
 
+interface IAVS {
+    function validateAction(bytes calldata data, bytes calldata avsProof) external view returns (bool);
+}
+
 /**
  * @title ZeanHook - Base contract for Uniswap V4 hooks
  * @notice This contract provides the foundation for implementing custom Uniswap V4 hooks.
@@ -30,22 +34,36 @@ contract ZeanHook is
 {
     using PoolIdLibrary for PoolKey;
 
-    // ========================= Modifiers =========================
+    IAVS public avs;
+
     modifier onlyOwner() {
         require(msg.sender == owner, "Only owner");
         _;
     }
 
+    modifier onlyAVSApproved(bytes memory data, bytes calldata avsProof) {
+        require(avs.validateAction(data, avsProof), "AVS: Not approved");
+        _;
+    }
+
     /**
-     * @notice Constructor initializes the hook with a PoolManager
+     * @notice Constructor initializes the hook with a PoolManager and AVS
      * @param _manager The address of the Uniswap V4 PoolManager contract
+     * @param _avs The address of the AVS contract
      * @dev Inherits from BaseHook which provides core functionality
      */
     constructor(
-        IPoolManager _manager
+        IPoolManager _manager,
+        address _avs
     ) BaseHook(_manager) {
         owner = msg.sender;
         authorizedExecutors[msg.sender] = true;
+        avs = IAVS(_avs);
+    }
+
+    function setAVS(address _avs) external onlyOwner {
+        require(_avs != address(0), "Invalid AVS address");
+        avs = IAVS(_avs);
     }
 
     // ========================= Hook Permissions =========================
@@ -105,6 +123,10 @@ contract ZeanHook is
         SwapParams calldata params,
         bytes calldata hookData
     ) internal override returns (bytes4, BeforeSwapDelta, uint24) {
+        // Extract avsProof from hookData (assume first 96 bytes for proof, rest is other data)
+        bytes calldata avsProof = hookData[:96];
+        bytes memory dataToValidate = abi.encode(sender, key, params);
+        require(avs.validateAction(dataToValidate, avsProof), "AVS: Swap not approved");
         PoolId poolId = key.toId();
         
         uint256 adjustedSlippage = calculateVolatilityAdjustedSlippage(poolId);
@@ -137,8 +159,12 @@ contract ZeanHook is
 
     // ========================= Commit-Reveal Batch Execution =========================
     function executeBatchAfterReveal(
-        PoolKey calldata key
+        PoolKey calldata key,
+        bytes calldata avsProof
     ) external override onlyAuthorizedExecutor noReentrant {
+        bytes memory dataToValidate = abi.encode(msg.sender, key, "executeBatchAfterReveal");
+        require(avs.validateAction(dataToValidate, avsProof), "AVS: Batch not approved");
+
         PoolId poolId = key.toId();
         BatchState storage batchState = batchStates[poolId];
 
@@ -187,8 +213,12 @@ contract ZeanHook is
     }
 
     function emergencyExecuteBatch(
-        PoolKey calldata key
+        PoolKey calldata key,
+        bytes calldata avsProof
     ) external override onlyOwner noReentrant {
+        bytes memory dataToValidate = abi.encode(msg.sender, key, "emergencyExecuteBatch");
+        require(avs.validateAction(dataToValidate, avsProof), "AVS: Emergency batch not approved");
+
         PoolId poolId = key.toId();
         BatchState storage batchState = batchStates[poolId];
 

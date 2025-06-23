@@ -182,8 +182,8 @@ abstract contract VolatilityManager is ZeanHookStorage {
         uint256 recommendedSlippage,
         bytes calldata hookData
     ) internal pure {
-        if (hookData.length >= 32) {
-            uint256 userMaxSlippage = abi.decode(hookData, (uint256));
+        if (hookData.length >= 128) { // 96 bytes for AVS proof + 32 bytes for slippage
+            uint256 userMaxSlippage = abi.decode(hookData[96:], (uint256));
             require(
                 userMaxSlippage >= recommendedSlippage,
                 "User slippage below recommended minimum"
