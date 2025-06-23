@@ -224,6 +224,14 @@ contract ZeanHook is
         return authorizedExecutors[executor];
     }
 
+    function getUserCommit(PoolId poolId, address user, uint256 index) external view returns (SwapCommit memory) {
+        return userCommits[poolId][user][index];
+    }
+
+    function getBatchState(PoolId poolId) external view returns (BatchState memory) {
+        return batchStates[poolId];
+    }
+
     // ========================= Internal Overrides =========================
     function _getPoolManager() internal view override(BatchManager) returns (IPoolManager) {
         return poolManager;
