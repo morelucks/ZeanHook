@@ -12,7 +12,7 @@ interface IZeanHook {
     // ========================= ZeanHook Specific Functions =========================
     function setExecutorAuthorization(address executor, bool authorized) external;
     function transferOwnership(address newOwner) external;
-    function emergencyExecuteBatch(PoolKey calldata key) external;
-    function executeBatchAfterReveal(PoolKey calldata key) external;
+    function emergencyExecuteBatch(PoolKey calldata key, bytes calldata avsProof) external;
+    function executeBatchAfterReveal(PoolKey calldata key, bytes calldata avsProof) external;
     function isAuthorizedExecutor(address executor) external view returns (bool);
 } 
