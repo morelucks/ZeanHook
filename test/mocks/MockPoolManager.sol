@@ -99,4 +99,47 @@ contract MockPoolManager {
     function accountPoolBalanceDelta(PoolKey memory, BalanceDelta, address) external pure {}
     
     function accountAppBalanceDelta(PoolKey memory, BalanceDelta, address) external pure {}
+
+    // Simulation functions for testing hooks as PoolManager
+    function simulateSwap(
+        address hook,
+        address sender,
+        PoolKey memory key,
+        SwapParams memory params,
+        bytes memory hookData
+    ) external {
+        // Call beforeSwap as PoolManager
+        (bool success, bytes memory returndata) = hook.call(
+            abi.encodeWithSignature(
+                "beforeSwap(address,(address,address,uint24,int24,address),(bool,int256,uint160),bytes)",
+                sender,
+                key,
+                params,
+                hookData
+            )
+        );
+        require(success, string(returndata));
+    }
+
+    function simulateAfterSwap(
+        address hook,
+        address sender,
+        PoolKey memory key,
+        SwapParams memory params,
+        BalanceDelta delta,
+        bytes memory hookData
+    ) external {
+        // Call afterSwap as PoolManager
+        (bool success, bytes memory returndata) = hook.call(
+            abi.encodeWithSignature(
+                "afterSwap(address,(address,address,uint24,int24,address),(bool,int256,uint160),int256,bytes)",
+                sender,
+                key,
+                params,
+                BalanceDelta.unwrap(delta),
+                hookData
+            )
+        );
+        require(success, string(returndata));
+    }
 } 
