@@ -15,4 +15,4 @@ interface IZeanHook {
     function emergencyExecuteBatch(PoolKey calldata key, bytes calldata avsProof) external;
     function executeBatchAfterReveal(PoolKey calldata key, bytes calldata avsProof) external;
     function isAuthorizedExecutor(address executor) external view returns (bool);
-} 
+}

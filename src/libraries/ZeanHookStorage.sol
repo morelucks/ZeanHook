@@ -87,4 +87,4 @@ contract ZeanHookStorage {
 
     address public owner;
     bool internal _executing;
-} 
+}

@@ -10,17 +10,13 @@ import {ZeanHook} from "src/ZeanHook.sol";
 contract DeployZeanHookScript is Script {
     address constant CREATE2_DEPLOYER = address(0x4e59b44847b379578588920cA78FbF26c0B4956C);
     IPoolManager constant POOLMANAGER = IPoolManager(address(0xE03A1074c86CFeDd5C142C4F04F1a1536e203543));
-    address constant AVS = address(0xa789c91ECDdae96865913130B786140Ee17aF545); 
+    address constant AVS = address(0xa789c91ECDdae96865913130B786140Ee17aF545);
 
     function setUp() public {}
 
     function run() public {
         // Set the flags for ZeanHook (update if you add more hook points)
-        uint160 flags = uint160(
-            Hooks.AFTER_INITIALIZE_FLAG |
-            Hooks.BEFORE_SWAP_FLAG |
-            Hooks.AFTER_SWAP_FLAG
-        );
+        uint160 flags = uint160(Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG);
 
         bytes memory constructorArgs = abi.encode(POOLMANAGER, AVS);
 
@@ -35,8 +31,4 @@ contract DeployZeanHookScript is Script {
 
         console.log("ZeanHook deployed at:", address(hook));
     }
-} 
-
-
-
-
+}

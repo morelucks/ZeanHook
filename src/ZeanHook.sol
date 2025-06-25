@@ -25,13 +25,7 @@ interface IAVS {
  * @title ZeanHook - Base contract for Uniswap V4 hooks
  * @notice This contract provides the foundation for implementing custom Uniswap V4 hooks.
  */
-contract ZeanHook is 
-    BaseHook, 
-    VolatilityManager, 
-    BatchManager, 
-    CommitRevealManager, 
-    IZeanHook 
-{
+contract ZeanHook is BaseHook, VolatilityManager, BatchManager, CommitRevealManager, IZeanHook {
     using PoolIdLibrary for PoolKey;
 
     IAVS public avs;
@@ -52,10 +46,7 @@ contract ZeanHook is
      * @param _avs The address of the AVS contract
      * @dev Inherits from BaseHook which provides core functionality
      */
-    constructor(
-        IPoolManager _manager,
-        address _avs
-    ) BaseHook(_manager) {
+    constructor(IPoolManager _manager, address _avs) BaseHook(_manager) {
         owner = msg.sender;
         authorizedExecutors[msg.sender] = true;
         avs = IAVS(_avs);
@@ -67,70 +58,56 @@ contract ZeanHook is
     }
 
     // ========================= Hook Permissions =========================
-    function getHookPermissions()
-        public
-        pure
-        override
-        returns (Hooks.Permissions memory)
-    {
-        return
-            Hooks.Permissions({
-                beforeInitialize: false,
-                afterInitialize: true,
-                beforeAddLiquidity: false,
-                beforeRemoveLiquidity: false,
-                afterAddLiquidity: false,
-                afterRemoveLiquidity: false,
-                beforeSwap: true,
-                afterSwap: true,
-                beforeDonate: false,
-                afterDonate: false,
-                beforeSwapReturnDelta: false,
-                afterSwapReturnDelta: false,
-                afterAddLiquidityReturnDelta: false,
-                afterRemoveLiquidityReturnDelta: false
-            });
+    function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
+        return Hooks.Permissions({
+            beforeInitialize: false,
+            afterInitialize: true,
+            beforeAddLiquidity: false,
+            beforeRemoveLiquidity: false,
+            afterAddLiquidity: false,
+            afterRemoveLiquidity: false,
+            beforeSwap: true,
+            afterSwap: true,
+            beforeDonate: false,
+            afterDonate: false,
+            beforeSwapReturnDelta: false,
+            afterSwapReturnDelta: false,
+            afterAddLiquidityReturnDelta: false,
+            afterRemoveLiquidityReturnDelta: false
+        });
     }
 
     // ========================= Hook Implementation =========================
-    function _afterInitialize(
-        address,
-        PoolKey calldata key,
-        uint160 sqrtPriceX96,
-        int24
-    ) internal override returns (bytes4) {
+    function _afterInitialize(address, PoolKey calldata key, uint160 sqrtPriceX96, int24)
+        internal
+        override
+        returns (bytes4)
+    {
         PoolId poolId = key.toId();
-        
-        priceHistory[poolId].push(PriceData({
-            sqrtPriceX96: sqrtPriceX96,
-            timestamp: block.timestamp
-        }));
-        
-        volatilityMetrics[poolId] = VolatilityMetrics({
-            volatility: MIN_SLIPPAGE,
-            lastUpdate: block.timestamp,
-            sampleCount: 1
-        });
-        
+
+        priceHistory[poolId].push(PriceData({sqrtPriceX96: sqrtPriceX96, timestamp: block.timestamp}));
+
+        volatilityMetrics[poolId] =
+            VolatilityMetrics({volatility: MIN_SLIPPAGE, lastUpdate: block.timestamp, sampleCount: 1});
+
         emit PriceRecorded(poolId, sqrtPriceX96, block.timestamp);
-        
+
         return BaseHook.afterInitialize.selector;
     }
 
-    function _beforeSwap(
-        address sender,
-        PoolKey calldata key,
-        SwapParams calldata params,
-        bytes calldata hookData
-    ) internal override returns (bytes4, BeforeSwapDelta, uint24) {
+    function _beforeSwap(address sender, PoolKey calldata key, SwapParams calldata params, bytes calldata hookData)
+        internal
+        override
+        returns (bytes4, BeforeSwapDelta, uint24)
+    {
         // Extract avsProof from hookData (assume first 96 bytes for proof, rest is other data)
         bytes calldata avsProof = hookData[:96];
         bytes memory dataToValidate = abi.encode(sender, key, params);
         require(avs.validateAction(dataToValidate, avsProof), "AVS: Swap not approved");
         PoolId poolId = key.toId();
-        
+
         uint256 adjustedSlippage = calculateVolatilityAdjustedSlippage(poolId);
-        
+
         _validateSwapSlippage(adjustedSlippage, hookData);
 
         _queueSwap(poolId, key, sender, params, hookData);
@@ -138,30 +115,30 @@ contract ZeanHook is
         return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
     }
 
-    function _afterSwap(
-        address,
-        PoolKey calldata key,
-        SwapParams calldata,
-        BalanceDelta,
-        bytes calldata
-    ) internal override returns (bytes4, int128) {
+    function _afterSwap(address, PoolKey calldata key, SwapParams calldata, BalanceDelta, bytes calldata)
+        internal
+        override
+        returns (bytes4, int128)
+    {
         PoolId poolId = key.toId();
-        
+
         uint160 currentSqrtPrice = _getCurrentSqrtPrice(poolId);
         _recordPriceData(poolId, currentSqrtPrice);
-        
+
         _updateVolatilityMetrics(poolId);
-        
+
         lastSwapTimestamp[poolId] = block.timestamp;
-        
+
         return (BaseHook.afterSwap.selector, 0);
     }
 
     // ========================= Commit-Reveal Batch Execution =========================
-    function executeBatchAfterReveal(
-        PoolKey calldata key,
-        bytes calldata avsProof
-    ) external override onlyAuthorizedExecutor noReentrant {
+    function executeBatchAfterReveal(PoolKey calldata key, bytes calldata avsProof)
+        external
+        override
+        onlyAuthorizedExecutor
+        noReentrant
+    {
         bytes memory dataToValidate = abi.encode(msg.sender, key, "executeBatchAfterReveal");
         require(avs.validateAction(dataToValidate, avsProof), "AVS: Batch not approved");
 
@@ -169,10 +146,7 @@ contract ZeanHook is
         BatchState storage batchState = batchStates[poolId];
 
         require(batchState.revealPhaseActive, "No active reveal phase");
-        require(
-            block.timestamp >= batchState.revealPhaseStart + REVEAL_PHASE_DURATION,
-            "Reveal phase not ended"
-        );
+        require(block.timestamp >= batchState.revealPhaseStart + REVEAL_PHASE_DURATION, "Reveal phase not ended");
 
         // Convert revealed commits to batched swaps
         _processRevealedCommits(poolId, key);
@@ -189,19 +163,11 @@ contract ZeanHook is
         // Clear commit data
         _clearCommitData(poolId);
 
-        emit BatchExecuted(
-            poolId,
-            executedCount,
-            executionPrice,
-            block.timestamp
-        );
+        emit BatchExecuted(poolId, executedCount, executionPrice, block.timestamp);
     }
 
     // ========================= Admin Functions =========================
-    function setExecutorAuthorization(
-        address executor,
-        bool authorized
-    ) external override onlyOwner {
+    function setExecutorAuthorization(address executor, bool authorized) external override onlyOwner {
         authorizedExecutors[executor] = authorized;
         emit ExecutorAuthorized(executor, authorized);
     }
@@ -212,10 +178,12 @@ contract ZeanHook is
         authorizedExecutors[newOwner] = true;
     }
 
-    function emergencyExecuteBatch(
-        PoolKey calldata key,
-        bytes calldata avsProof
-    ) external override onlyOwner noReentrant {
+    function emergencyExecuteBatch(PoolKey calldata key, bytes calldata avsProof)
+        external
+        override
+        onlyOwner
+        noReentrant
+    {
         bytes memory dataToValidate = abi.encode(msg.sender, key, "emergencyExecuteBatch");
         require(avs.validateAction(dataToValidate, avsProof), "AVS: Emergency batch not approved");
 
@@ -239,18 +207,11 @@ contract ZeanHook is
             batchState.referenceSqrtPriceX96 = _getCurrentPrice(key);
         }
 
-        emit BatchExecuted(
-            poolId,
-            executedCount,
-            executionPrice,
-            block.timestamp
-        );
+        emit BatchExecuted(poolId, executedCount, executionPrice, block.timestamp);
     }
 
     // ========================= View Functions =========================
-    function isAuthorizedExecutor(
-        address executor
-    ) external view override returns (bool) {
+    function isAuthorizedExecutor(address executor) external view override returns (bool) {
         return authorizedExecutors[executor];
     }
 
@@ -267,9 +228,14 @@ contract ZeanHook is
         return poolManager;
     }
 
-    function _getCurrentSqrtPrice(PoolId poolId) internal view override(BatchManager, VolatilityManager) returns (uint160) {
+    function _getCurrentSqrtPrice(PoolId poolId)
+        internal
+        view
+        override(BatchManager, VolatilityManager)
+        returns (uint160)
+    {
         bytes32 slot0 = poolManager.extsload(bytes32(uint256(PoolId.unwrap(poolId))));
         uint160 sqrtPriceX96 = uint160(uint256(slot0));
         return sqrtPriceX96;
     }
-} 
+}

@@ -10,34 +10,14 @@ import {StateLibrary} from "v4-core/libraries/StateLibrary.sol";
 import {ZeanHookStorage} from "./ZeanHookStorage.sol";
 
 abstract contract BatchManager is ZeanHookStorage {
-    
     // ========================= Events =========================
-    event SwapQueued(
-        PoolId indexed poolId,
-        address indexed user,
-        uint256 batchIndex,
-        uint256 queueTime
-    );
+    event SwapQueued(PoolId indexed poolId, address indexed user, uint256 batchIndex, uint256 queueTime);
 
-    event BatchExecuted(
-        PoolId indexed poolId,
-        uint256 swapsExecuted,
-        uint160 executionPrice,
-        uint256 timestamp
-    );
+    event BatchExecuted(PoolId indexed poolId, uint256 swapsExecuted, uint160 executionPrice, uint256 timestamp);
 
-    event SwapFailed(
-        PoolId indexed poolId,
-        address indexed user,
-        uint256 batchIndex,
-        string reason
-    );
+    event SwapFailed(PoolId indexed poolId, address indexed user, uint256 batchIndex, string reason);
 
-    event BatchInitialized(
-        PoolId indexed poolId,
-        uint160 referencePrice,
-        uint256 startTime
-    );
+    event BatchInitialized(PoolId indexed poolId, uint160 referencePrice, uint256 startTime);
 
     // ========================= Modifiers =========================
     modifier noReentrant() {
@@ -63,16 +43,7 @@ abstract contract BatchManager is ZeanHookStorage {
             require(maxSqrtPriceX96 > minSqrtPriceX96, "Invalid price limits");
         }
 
-        _addSwapToBatch(
-            poolId,
-            key,
-            msg.sender,
-            params,
-            minAmountOut,
-            maxSqrtPriceX96,
-            minSqrtPriceX96,
-            hookData
-        );
+        _addSwapToBatch(poolId, key, msg.sender, params, minAmountOut, maxSqrtPriceX96, minSqrtPriceX96, hookData);
     }
 
     // ========================= Internal Functions =========================
@@ -84,24 +55,10 @@ abstract contract BatchManager is ZeanHookStorage {
         bytes calldata hookData
     ) internal {
         // Decode additional parameters from hookData if provided
-        (
-            uint256 minAmountOut,
-            uint160 maxSqrtPriceX96,
-            uint160 minSqrtPriceX96
-        ) = hookData.length >= 96
-                ? abi.decode(hookData, (uint256, uint160, uint160))
-                : (0, uint160(0), uint160(0));
+        (uint256 minAmountOut, uint160 maxSqrtPriceX96, uint160 minSqrtPriceX96) =
+            hookData.length >= 96 ? abi.decode(hookData, (uint256, uint160, uint160)) : (0, uint160(0), uint160(0));
 
-        _addSwapToBatch(
-            poolId,
-            key,
-            user,
-            params,
-            minAmountOut,
-            maxSqrtPriceX96,
-            minSqrtPriceX96,
-            hookData
-        );
+        _addSwapToBatch(poolId, key, user, params, minAmountOut, maxSqrtPriceX96, minSqrtPriceX96, hookData);
     }
 
     function _addSwapToBatch(
@@ -137,19 +94,10 @@ abstract contract BatchManager is ZeanHookStorage {
             batchState.batchActive = true;
             batchState.batchStartTime = block.timestamp;
             batchState.referenceSqrtPriceX96 = _getCurrentSqrtPrice(poolId);
-            emit BatchInitialized(
-                poolId,
-                batchState.referenceSqrtPriceX96,
-                block.timestamp
-            );
+            emit BatchInitialized(poolId, batchState.referenceSqrtPriceX96, block.timestamp);
         }
 
-        emit SwapQueued(
-            poolId,
-            user,
-            poolBatches[poolId].length - 1,
-            block.timestamp
-        );
+        emit SwapQueued(poolId, user, poolBatches[poolId].length - 1, block.timestamp);
     }
 
     function _executeSwapAtReferencePrice(
@@ -169,18 +117,11 @@ abstract contract BatchManager is ZeanHookStorage {
             sqrtPriceLimitX96: referenceSqrtPriceX96
         });
 
-        try _getPoolManager().swap(key, batchParams, swapData.hookData) returns (
-            BalanceDelta delta
-        ) {
+        try _getPoolManager().swap(key, batchParams, swapData.hookData) returns (BalanceDelta delta) {
             // Validate minimum output if specified
             if (swapData.minAmountOut > 0) {
-                int256 outputAmount = swapData.params.zeroForOne
-                    ? -delta.amount1()
-                    : -delta.amount0();
-                if (
-                    outputAmount < 0 ||
-                    uint256(outputAmount) < swapData.minAmountOut
-                ) {
+                int256 outputAmount = swapData.params.zeroForOne ? -delta.amount1() : -delta.amount0();
+                if (outputAmount < 0 || uint256(outputAmount) < swapData.minAmountOut) {
                     return false;
                 }
             }
@@ -190,34 +131,22 @@ abstract contract BatchManager is ZeanHookStorage {
         }
     }
 
-    function _executeSwapBatch(
-        PoolKey calldata key,
-        PoolId poolId,
-        uint160 executionPrice
-    ) internal returns (uint256 executedCount) {
+    function _executeSwapBatch(PoolKey calldata key, PoolId poolId, uint160 executionPrice)
+        internal
+        returns (uint256 executedCount)
+    {
         BatchedSwap[] storage batch = poolBatches[poolId];
         executedCount = 0;
 
         // Execute swaps up to maximum batch size
-        for (
-            uint256 i = 0;
-            i < batch.length && executedCount < MAX_BATCH_SIZE;
-            i++
-        ) {
+        for (uint256 i = 0; i < batch.length && executedCount < MAX_BATCH_SIZE; i++) {
             if (!batch[i].isExecuted) {
-                if (
-                    _executeSwapAtReferencePrice(key, batch[i], executionPrice)
-                ) {
+                if (_executeSwapAtReferencePrice(key, batch[i], executionPrice)) {
                     batch[i].isExecuted = true;
                     executedCount++;
                     userPendingSwaps[poolId][batch[i].user]--;
                 } else {
-                    emit SwapFailed(
-                        poolId,
-                        batch[i].user,
-                        i,
-                        "Execution failed"
-                    );
+                    emit SwapFailed(poolId, batch[i].user, i, "Execution failed");
                 }
             }
         }
@@ -228,54 +157,39 @@ abstract contract BatchManager is ZeanHookStorage {
         return executedCount;
     }
 
-    function _validatePriceLimits(
-        BatchedSwap memory swapData,
-        uint160 referenceSqrtPriceX96
-    ) internal pure returns (bool) {
+    function _validatePriceLimits(BatchedSwap memory swapData, uint160 referenceSqrtPriceX96)
+        internal
+        pure
+        returns (bool)
+    {
         // Check price limits based on swap direction
         if (swapData.params.zeroForOne) {
             // For zeroForOne swaps, check minimum price
-            if (
-                swapData.minSqrtPriceX96 > 0 &&
-                referenceSqrtPriceX96 < swapData.minSqrtPriceX96
-            ) {
+            if (swapData.minSqrtPriceX96 > 0 && referenceSqrtPriceX96 < swapData.minSqrtPriceX96) {
                 return false;
             }
         } else {
             // For oneForZero swaps, check maximum price
-            if (
-                swapData.maxSqrtPriceX96 > 0 &&
-                referenceSqrtPriceX96 > swapData.maxSqrtPriceX96
-            ) {
+            if (swapData.maxSqrtPriceX96 > 0 && referenceSqrtPriceX96 > swapData.maxSqrtPriceX96) {
                 return false;
             }
         }
         return true;
     }
 
-    function _getCurrentPrice(
-        PoolKey calldata key
-    ) internal view returns (uint160) {
+    function _getCurrentPrice(PoolKey calldata key) internal view returns (uint160) {
         PoolId poolId = key.toId();
-        (uint160 sqrtPriceX96, , , ) = StateLibrary.getSlot0(
-            _getPoolManager(),
-            poolId
-        );
+        (uint160 sqrtPriceX96,,,) = StateLibrary.getSlot0(_getPoolManager(), poolId);
         return sqrtPriceX96;
     }
 
-    function _isPriceWithinThreshold(
-        uint160 referencePrice,
-        uint160 currentPrice
-    ) internal pure returns (bool) {
+    function _isPriceWithinThreshold(uint160 referencePrice, uint160 currentPrice) internal pure returns (bool) {
         if (referencePrice == 0 || currentPrice == 0) return false;
 
-        uint256 priceDiff = referencePrice > currentPrice
-            ? referencePrice - currentPrice
-            : currentPrice - referencePrice;
+        uint256 priceDiff =
+            referencePrice > currentPrice ? referencePrice - currentPrice : currentPrice - referencePrice;
 
-        uint256 threshold = (uint256(referencePrice) *
-            PRICE_DEVIATION_THRESHOLD) / BASIS_POINTS;
+        uint256 threshold = (uint256(referencePrice) * PRICE_DEVIATION_THRESHOLD) / BASIS_POINTS;
 
         return priceDiff <= threshold;
     }
@@ -301,9 +215,7 @@ abstract contract BatchManager is ZeanHookStorage {
     }
 
     // ========================= View Functions =========================
-    function getBatchInfo(
-        PoolId poolId
-    )
+    function getBatchInfo(PoolId poolId)
         external
         view
         returns (
@@ -332,26 +244,21 @@ abstract contract BatchManager is ZeanHookStorage {
         );
     }
 
-    function getUserPendingSwaps(
-        PoolId poolId,
-        address user
-    ) external view returns (uint256) {
+    function getUserPendingSwaps(PoolId poolId, address user) external view returns (uint256) {
         return userPendingSwaps[poolId][user];
     }
 
     function canExecuteBatch(PoolId poolId) external view returns (bool) {
         BatchState memory state = batchStates[poolId];
-        return
-            state.batchActive &&
-            block.timestamp >= state.batchStartTime + BATCH_INTERVAL &&
-            poolBatches[poolId].length > 0;
+        return state.batchActive && block.timestamp >= state.batchStartTime + BATCH_INTERVAL
+            && poolBatches[poolId].length > 0;
     }
 
-    function getBatchDetails(
-        PoolId poolId,
-        uint256 startIndex,
-        uint256 count
-    ) external view returns (BatchedSwap[] memory) {
+    function getBatchDetails(PoolId poolId, uint256 startIndex, uint256 count)
+        external
+        view
+        returns (BatchedSwap[] memory)
+    {
         BatchedSwap[] storage batch = poolBatches[poolId];
         require(startIndex < batch.length, "Start index out of bounds");
 
@@ -368,9 +275,7 @@ abstract contract BatchManager is ZeanHookStorage {
         return result;
     }
 
-    function getNextExecutionTime(
-        PoolId poolId
-    ) external view returns (uint256) {
+    function getNextExecutionTime(PoolId poolId) external view returns (uint256) {
         BatchState memory state = batchStates[poolId];
         if (!state.batchActive) {
             return 0;
@@ -381,4 +286,4 @@ abstract contract BatchManager is ZeanHookStorage {
     // ========================= Abstract Functions =========================
     function _getPoolManager() internal view virtual returns (IPoolManager);
     function _getCurrentSqrtPrice(PoolId poolId) internal view virtual returns (uint160);
-} 
+}
